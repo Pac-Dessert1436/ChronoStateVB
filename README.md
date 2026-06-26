@@ -1,114 +1,203 @@
-# `GameRewindSystemVB` - A Rewind System for Games, Inspired by Transaction Model
+# `ChronoStateVB` - Game State Management Toolkit for VB.NET
 
-## Description
-`GameRewindSystemVB` is a meticulous rewind system for game development that brings database transaction concepts to interactive gaming scenarios. This innovative framework enables game developers to implement robust undo/redo functionality, checkpoint systems, and state rollback mechanisms with enterprise-level reliability.
+`ChronoStateVB` is a robust game state management toolkit tailored for VB.NET, offering two core capabilities: **parallel background computation** with lock-free double buffering, and **event-driven rewind/undo functionality** with state checkpointing.
 
-The system adapts the proven transaction model from database systems - where operations are atomic, consistent, isolated, and durable (ACID properties) - to game development contexts. This approach provides a structured way to manage game state changes, allowing developers to:
-
-- **Implement reliable undo/redo functionality** for player actions
-- **Create checkpoint systems** that save game progress at specific points
-- **Handle game state rollbacks** for scenarios like player death or level resets
-- **Manage complex state transitions** with transactional guarantees
-
-Unlike traditional game development approaches that often rely on ad-hoc state management, `GameRewindSystemVB` provides a systematic framework that ensures state consistency and simplifies the implementation of rewind capabilities across various game genres and platforms.
-
-## Requirements
-
-- [.NET 10.0](https://dotnet.microsoft.com/download/dotnet/10.0) or higher
-- Visual Basic .NET compatible development environment, such as:
-  - [Visual Studio 2022/2026](https://visualstudio.microsoft.com/vs/)
-  - [Visual Studio Code](https://code.visualstudio.com/)
-  - Any other VB.NET-compatible IDE
+Built specifically for VB.NET game development, this library integrates seamlessly with popular frameworks including [MonoGame](https://www.monogame.net/) and DualBrain's [vbPixelGameEngine](https://github.com/DualBrain/vbPixelGameEngine), as well as other custom VB.NET game projects.
 
 ## Features
 
-- **Transaction-Inspired Design**: Implements a transaction-like model for game state management
-- **Thread-Safe Singleton**: Thread-safe implementation using lazy initialization
-- **Event-Driven Architecture**: Supports rewind request events for game flow integration
-- **Batch Execution**: Execute multiple operations in batch with logging support
-- **Flexible Rewind Reasons**: Built-in enumeration for common game scenarios (player death, undo, level reset, etc.)
-- **Generic Type Support**: Supports any save data type through generics
-- **Exception Handling**: Robust error handling with logging capabilities
+- **BackgroundComputeAgent** — Run parallel computations on a background thread and safely exchange data with the main thread via lock-free double buffering
+- **GameRewindSystem** — Event-driven, thread-safe singleton that executes operations in batch and rewinds them in reverse order
+- **IRewindable / RewindReason** — Interface and enum for implementing rewindable game operations with categorized reasons
 
-## Architecture
+## Requirements
 
-The system is built around two main components:
+- [.NET SDK 10.0+](https://dotnet.microsoft.com/en-us/download/dotnet/10.0)
+- VB.NET development tools
 
-### 1. GameRewindSystem(Of T)
-A thread-safe singleton class that manages the rewind operations:
-- **RegisterRewindable()**: Register operations for execution
-- **ExecuteBatch()**: Execute all pending operations in batch
-- **TriggerRewind()**: Trigger rewind to previous checkpoint
-- **PendingRewindableCount**: Get count of pending operations
-- **ClearRewindables()**: Clear all pending operations
+## Installation
 
-### 2. IRewindable(Of T) Interface
-Interface that game objects must implement to support rewind functionality:
-- **Checkpoint Property**: Save state before execution
-- **Execute()**: Advance the game state
-- **Rewind()**: Return to checkpoint state
+### NuGet
 
-## Usage Example
+```bash
+dotnet add package ChronoStateVB
+```
 
-1. Define a rewindable class:
+### Manual
+
+Clone the repository and add the `.vb` source files directly to your project, or reference the compiled `ChronoStateVB.dll`.
+
+## Usage
+
+### `BackgroundComputeAgent`
+
+Run a data array computation in parallel on a background thread, and consume the results on the main thread without stalling either side.
+
 ```vb
-' Example implementation for a player movement system
-Public Class PlayerMovementRewindable
-    Implements IRewindable(Of PlayerState)
+' Define a value type for the computed data
+Private Structure ParticleState
+    Dim X As Single
+    Dim Y As Single
+    Dim Velocity As Single
+End Structure
 
-    Public Property Checkpoint As PlayerState Implements IRewindable(Of PlayerState).Checkpoint
-    
-    Public Sub Execute() Implements IRewindable(Of PlayerState).Execute
-        ' Move player forward in the game
-        ' Update player position, velocity, etc.
+Private _agent As BackgroundComputeAgent(Of ParticleState)
+
+' During `Initialize` phase:
+_agent = New BackgroundComputeAgent(Of ParticleState)(
+    dataLength:=1024,
+    computeFunc:=Function(i)
+                     ' Compute particle i — runs on a background thread
+                     Dim rng As Single = CSng(Random.Shared.NextDouble())
+                     Return New ParticleState With {
+                         .X = i * 0.5F,
+                         .Y = rng * 100.0F,
+                         .Velocity = rng * 2.0F
+                     }
+                 End Function,
+    onDataReady:=Sub(data)
+                     ' Called on the main thread when new data is available
+                     ' e.g., update vertex buffers, trigger rendering
+                 End Sub,
+    targetIntervalMs:=33  ' ≈ 30 fps
+)
+_agent.BeginCompute()
+
+' During `Update` phase (main thread):
+_agent.TrySwap()  ' Returns True if a buffer swap occurred
+
+' Access the latest data at any time:
+Dim currentData = _agent.CurrentBufferData
+
+' During UnloadContent or shutdown:
+_agent.Dispose()
+```
+
+**How it works:**
+
+1. The background thread runs `Parallel.For` over all indices, writing results into the background buffer
+2. When a computation cycle completes, it sets an atomic swap flag
+3. The main thread calls `TrySwap()` each frame — if the flag is set, the two buffer pointers are exchanged atomically and the `onDataReady` callback fires
+4. No locks are needed on the hot path — only `Interlocked` operations for the swap flag and pointer swap
+
+### `GameRewindSystem`
+
+Register operations that can be undone, execute them in batch, and rewind all executed operations in reverse order when needed.
+
+```vb
+' Define your save data type
+Private Structure PlayerCheckpoint
+    Dim PositionX As Single
+    Dim PositionY As Single
+    Dim Health As Integer
+End Structure
+
+' Implement IRewindable(Of T)
+Public Class MoveAction
+    Implements IRewindable(Of PlayerCheckpoint)
+
+    Public Property Checkpoint As PlayerCheckpoint Implements IRewindable(Of PlayerCheckpoint).Checkpoint
+
+    Private ReadOnly _player As Player
+
+    Public Sub New(player As Player)
+        _player = player
+        ' Save checkpoint before execution
+        Checkpoint = New PlayerCheckpoint With {
+            .PositionX = player.X,
+            .PositionY = player.Y,
+            .Health = player.Health
+        }
     End Sub
-    
-    Public Sub Rewind(reason As RewindReason, message As String) Implements IRewindable(Of PlayerState).Rewind
-        ' Restore player to checkpoint state
-        ' Reset position, velocity, animation state, etc.
+
+    Public Sub Execute() Implements IRewindable(Of PlayerCheckpoint).Execute
+        ' Advance the game state
+        _player.MoveTo(_player.TargetX, _player.TargetY)
+    End Sub
+
+    Public Sub Rewind(reason As RewindReason, message As String) Implements IRewindable(Of PlayerCheckpoint).Rewind
+        ' Restore from checkpoint
+        _player.X = Checkpoint.PositionX
+        _player.Y = Checkpoint.PositionY
+        _player.Health = Checkpoint.Health
     End Sub
 End Class
+
+' Usage in game flow:
+Dim rewindSystem = GameRewindSystem(Of PlayerCheckpoint).Instance
+
+' Register operations before execution
+rewindSystem.RegisterRewindable(New MoveAction(player1))
+rewindSystem.RegisterRewindable(New MoveAction(player2))
+
+' Execute all pending operations in batch
+rewindSystem.ExecuteBatch(Sub(msg) Debug.WriteLine(msg))
+
+' Later, when the player dies:
+rewindSystem.TriggerRewind(RewindReason.PlayerDeath, "Player fell into lava")
+
+' Or when the player presses undo:
+rewindSystem.TriggerRewind(RewindReason.PlayerUndo)
+
+' When a level ends and history is no longer needed:
+rewindSystem.ClearExecutedHistory()
 ```
 
-2. Register the rewindable in the game loop:
-```vb
-With GameRewindSystem(Of PlayerState).Instance
-    ' Register operations during gameplay
-    .RegisterRewindable(New PlayerMovementRewindable)
-    ' Execute batch of operations
-    .ExecuteBatch(Sub(msg) Console.WriteLine(msg))
-    ' Trigger rewind when needed (e.g., player dies)
-    .TriggerRewind(RewindReason.PlayerDeath, "Player died - rewinding")
-End With
-```
+**How it works:**
 
-## Rewind Reasons
+1. Register `IRewindable(Of T)` operations before execution
+2. `ExecuteBatch` runs all pending operations and accumulates them in history (multiple batches accumulate)
+3. `TriggerRewind` rewinds all successfully executed operations in reverse order, then clears history
+4. Failed operations (exceptions during `Execute`) are skipped during rewind
+5. The `RewindRequested` event fires before any rewind, allowing subscribers to react
 
-The system includes predefined rewind reasons:
-- **Custom**: Custom rewind scenario
-- **PlayerDeath**: Player character death
-- **PlayerUndo**: Player-initiated undo operation
-- **LevelReset**: Level reset or restart
-- **GameExiting**: Game exit or shutdown
+### `RewindReason` Enum
 
-## Installation & Usage
+| Member | Value | Description |
+|---|---|---|
+| `Custom` | 0 | Custom rewind scenario |
+| `PlayerDeath` | 1 | Player character death |
+| `PlayerUndo` | 2 | Player-initiated undo operation |
+| `LevelReset` | 3 | Level reset or restart |
+| `GameExiting` | 4 | Game exiting or shutdown |
 
-1. Clone or download the repository, and navigate to the project directory:
-```bash
-git clone https://github.com/Pac-Dessert1436/GameRewindSystemVB.git
-cd GameRewindSystemVB
-```
-2. Reference this library into your VB.NET project:
-```bash
-dotnet add path/to/YourProject.vbproj reference GameRewindSystemVB.vbproj
-```
-> **Note**: You can also manually copy `GameRewindSystem.vb` and `IRewindable.vb` to your VB.NET project.
-3. Implement the `IRewindable(Of T)` interface for your game objects
-4. Use the `GameRewindSystem(Of T).Instance` singleton in your game loop
+## API Reference
 
-## Contributing
+### `BackgroundComputeAgent(Of T As Structure)`
 
-Contributions are welcome! Please feel free to submit pull requests or open issues for bug reports and feature requests.
+| Member | Description |
+|---|---|
+| `New(dataLength, computeFunc, onDataReady, targetIntervalMs)` | Constructor. `targetIntervalMs` defaults to 33 (≈ 30 fps) |
+| `BeginCompute()` | Starts the background computation loop |
+| `EndCompute()` | Signals the background task to stop |
+| `WaitForStop(timeoutMs)` | Waits for the background task to fully stop (default 3000 ms) |
+| `TrySwap() As Boolean` | Main thread call — checks for new data and swaps buffers if available |
+| `CurrentBufferData As T()` | Gets the current buffer (safe to read from the main thread) |
+| `Dispose()` | Stops computation and releases resources |
+
+### `GameRewindSystem(Of T)`
+
+| Member | Description |
+|---|---|
+| `Instance` | Thread-safe singleton instance |
+| `RegisterRewindable(rewindable)` | Registers a rewindable operation for execution |
+| `UnregisterRewindable(rewindable)` | Removes a previously registered operation |
+| `ExecuteBatch(logAction)` | Executes all pending operations and accumulates history |
+| `TriggerRewind(reason, message, logAction)` | Rewinds all executed operations in reverse order |
+| `PendingRewindableCount As Integer` | Number of pending (not yet executed) operations |
+| `ExecutedCount As Integer` | Number of items in execution history |
+| `ClearRewindables()` | Clears all pending operations |
+| `ClearHistory()` | Clears execution history (prevents rewinding cleared items) |
+| `RewindRequested` | Event raised when a rewind is triggered |
+
+### `IRewindable(Of T)`
+
+| Member | Description |
+|---|---|
+| `Checkpoint As T` | State snapshot saved before execution |
+| `Execute()` | Execute the operation to advance the game |
+| `Rewind(reason, message)` | Rewind to the checkpoint state |
 
 ## License
-This project is licensed under the BSD 3-Clause License. See the [LICENSE](LICENSE) file for details.
+
+[BSD 3-Clause](LICENSE)
